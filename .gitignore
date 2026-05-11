@@ -65,3 +65,7 @@ certs/
 # Misc
 *.log
 .cache/
+
+# Prospection / data Phase 0 (hors scope code)
+Commerces_*.xlsx
+build_commerces_xlsx.py
