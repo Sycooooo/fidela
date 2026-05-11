@@ -12,8 +12,8 @@ Document vivant. Mis à jour à chaque paquet de livrables produit.
 | Paquet | Livrables (section 9 du brief) | Statut |
 |---|---|---|
 | **1** | 1. Schéma DDL · 2. Policies RLS · 3. Diagramme archi | Validé tacitement par Solal ("ça va, continue") |
-| **2** | 4. Routes API · 5. Server actions vs API · 6. Certifs Apple · 7. Flow client | **À VALIDER par Solal** |
-| 3 | 8. Flow commerçant · 9. Stratégie tests · 10. Estimation complexité · 11. Risques · 12. Plan sprints | À venir |
+| **2** | 4. Routes API · 5. Server actions vs API · 6. Certifs Apple · 7. Flow client | Validé tacitement par Solal ("ça me va, commit") |
+| **3** | 8. Flow commerçant · 9. Stratégie tests · 10. Estimation complexité · 11. Risques · 12. Plan sprints | **À VALIDER par Solal** |
 
 ---
 
@@ -543,3 +543,568 @@ Avant que je passe au paquet 3, valider :
 4. **Flow client** : ça correspond à ce que tu imaginais ? La distinction iOS/Android te va ?
 
 Note : tu n'as **rien à exécuter** pour ce paquet (pas de SQL). Tout est de la spec.
+
+---
+
+# Paquet 3 — Opérationnel : flow commerçant, tests, planning, risques
+
+## Livrable 8 — Flow détaillé du parcours commerçant
+
+### Vue d'ensemble en 4 phases
+
+```
+Phase 1 — DÉCOUVERTE       Phase 2 — ONBOARDING           Phase 3 — CONFIG            Phase 4 — QUOTIDIEN
+  Landing → CTA             Signup → wizard → paiement     Branding + programme        Scan tampon récurrent
+                                                                                          + claim récompense
+```
+
+### Phase 1 — Découverte (avant inscription)
+
+```
+[1] Visite https://fidela.fr depuis canal acquisition (Insta, démarchage terrain)
+        │ Server Component : page landing (next/image, statique sauf hero CTA)
+        ▼
+[2] Voit pitch + démo en GIF + tarif (99€ setup + 19€/mois)
+        │ CTA primaire : "Démarrer mon programme" → /signup
+        │ CTA secondaire : "S'inscrire à la liste d'attente" → POST /api/waitlist
+        ▼
+[3] Click "Démarrer" → /signup
+```
+
+### Phase 2 — Onboarding (inscription + paiement)
+
+```
+[4] /signup — formulaire email + mot de passe
+        │ Supabase Auth : signUp({ email, password })
+        │ Email de vérification envoyé automatiquement par Supabase
+        ▼
+[5] Click lien email → /auth/callback → session active
+        │ Server Component détecte qu'il n'y a pas encore de merchant lié
+        │ → redirige /onboarding
+        ▼
+[6] /onboarding — wizard multi-étapes (state local React, pas de persist tant que pas payé)
+        │ Étape 1 : nom boutique, type d'activité (enum), adresse, téléphone
+        │ Étape 2 : upload logo → POST /api/uploads/logo (Supabase Storage bucket "logos")
+        │ Étape 3 : config programme (nom, stamps_required, reward_description, couleurs)
+        │ Étape 4 : choix slug (`/c/[slug]`) — vérif disponibilité côté serveur
+        │ Étape 5 : preview du pass Apple ET Google (mock visuel, pas de génération réelle)
+        │ Étape 6 : récap + bouton "Procéder au paiement"
+        ▼
+[7] Click "Procéder au paiement" → POST /api/onboarding/checkout
+        │ body: { tous les champs du wizard }
+        │ Server :
+        │   - Validation Zod
+        │   - Crée stripe customer
+        │   - Crée Stripe Checkout session (setup_fee 99€ + subscription 19€/mois)
+        │   - Stocke draft merchant en table "onboarding_drafts" (clé = user_id)
+        │   - Retourne checkout_url
+        ▼
+[8] Redirige Stripe Checkout (site Stripe, pas Fidela)
+        │ Client paie
+        ▼
+[9] Stripe redirige /onboarding/success?session_id=...
+        │ Server vérifie session_id, mais NE crée PAS le merchant ici
+        │ (la création se fait dans le webhook, source de vérité Stripe)
+        │ → écran "Activation en cours" avec polling /api/onboarding/status
+        ▼
+[10] Stripe envoie webhook POST /api/webhooks/stripe : event = checkout.session.completed
+        │ Server (service_role) :
+        │   - Vérifie signature (OBLIGATOIRE)
+        │   - Idempotence : check stripe event ID pas déjà traité
+        │   - Lit onboarding_drafts par user_id
+        │   - INSERT merchant (subscription_status = active)
+        │   - INSERT loyalty_program associé
+        │   - DELETE onboarding_drafts row
+        │   - Renvoie 200
+        ▼
+[11] Polling côté client détecte merchant créé → redirige /dashboard
+```
+
+### Phase 3 — Configuration post-paiement (one-time)
+
+```
+[12] /dashboard — première visite
+        │ Server Component charge merchant + loyalty_program + stats
+        ▼
+[13] Affichage onboarding cards :
+        - Card 1 : "Imprimer votre QR code boutique" → /dashboard/qrcode
+        - Card 2 : "Test du flow client" → ouvre /c/[slug] dans nouvel onglet
+        - Card 3 : "Premier client à tamponner" → /dashboard/stamp
+        ▼
+[14] /dashboard/qrcode
+        │ Génère QR code (lib `qrcode`) pointant vers https://fidela.fr/c/[slug]
+        │ Bouton "Télécharger PDF" (jspdf) format A5 prêt à imprimer
+        ▼
+[15] Commerçant imprime, affiche en caisse
+```
+
+### Phase 4 — Quotidien (récurrent)
+
+#### A. Ajouter un tampon
+
+```
+[16] Commerçant ouvre dashboard sur smartphone → /dashboard/stamp
+        │ Active caméra via lib `@yudiel/react-qr-scanner`
+        ▼
+[17] Scan du QR pass client (apparait dans Wallet du client, le client le montre)
+        │ Le QR contient l'URL https://fidela.fr/p/[serial] OU directement le serial
+        │ → app extrait serial_number
+        ▼
+[18] Affichage écran de confirmation :
+        - photo logo client ou initiales
+        - "Jean D. (jean@...) — 7/10 tampons"
+        - Bouton "Ajouter un tampon"
+        ▼
+[19] Click → POST /api/stamps { serial_number }
+        │ Server : add_stamp() Postgres function (atomique, anti-fraude 30 min)
+        │ Background : push update Apple + Google
+        ▼
+[20] Écran succès :
+        - Animation "8/10"
+        - Si current_stamps == stamps_required : bandeau "RÉCOMPENSE DISPONIBLE"
+        - Bouton "Tamponner un autre client" → retour /dashboard/stamp
+```
+
+#### B. Saisie code court (fallback si scan QR ne marche pas)
+
+```
+[17bis] Tap "Saisir code à la main"
+        │ Modal : input 6-8 chars
+        │ Le code court est dérivé du serial_number (ex: 6 premiers chars en majuscule)
+        ▼
+        Continue [18] avec serial complet récupéré DB par préfixe
+```
+
+#### C. Réclamer une récompense
+
+```
+[21] Sur écran tampon : si current_stamps == stamps_required
+        Bouton "Récompense utilisée — Reset compteur"
+        ▼
+[22] Click → POST /api/rewards/claim { pass_id }
+        │ Server : INSERT rewards_claimed + UPDATE customer_passes SET current_stamps = 0
+        │ Background : push update wallet
+        ▼
+[23] Écran confirmation "Récompense remise à [client]. Compteur à zéro."
+```
+
+#### D. Voir ses clients / stats
+
+```
+[24] /dashboard — liste clients (paginée si > 50)
+        - Colonnes : nom (déduit email), tampons, dernière visite, récompenses utilisées
+        - Filtres : actifs (last_visit_at < 30j), inactifs, récompense disponible
+[25] /dashboard/stats — basique :
+        - Nombre de clients inscrits
+        - Nombre total de tampons distribués (cette semaine, ce mois, total)
+        - Nombre de récompenses utilisées
+        - Heatmap horaire si nice-to-have
+```
+
+### Cas spéciaux (à gérer pour Bob)
+
+1. **Stripe webhook arrive en retard** (latence Stripe) : page success affiche "Activation en cours, ça peut prendre 1-2 min". Polling sur `/api/onboarding/status` toutes les 3s, timeout 60s avant de proposer support.
+2. **Stripe webhook jamais reçu** (rare mais possible) : cron job quotidien `/api/cron/reconcile-stripe` qui liste les `onboarding_drafts` > 1h et les réconcilie via API Stripe. Cron Vercel (Hobby plan limite à 2 cron/jour, suffisant).
+3. **Paiement échoué initial** : Stripe Checkout gère, redirige `/onboarding/cancel`. On garde le draft, on propose "Réessayer le paiement" qui re-crée une session.
+4. **Email de vérification non cliqué** : Supabase ne crée pas de session. L'user revient via `/signup`, on détecte email déjà inscrit non-vérifié, on renvoie l'email.
+5. **Slug déjà pris** : feedback temps réel dans le wizard (debounce 500ms), suggestion alternative.
+
+---
+
+## Livrable 9 — Stratégie de tests minimale
+
+### Philosophie
+
+Tu es solo, junior, claude-powered. **Pas de TDD obsessionnel.** Mais 3 zones où une erreur coûte de l'argent ou casse l'expérience à grande échelle. Ces 3 zones DOIVENT être testées.
+
+Ailleurs : tests manuels suffisent, à structurer en checklists par feature.
+
+### Outils
+
+| Type | Outil | Pourquoi |
+|---|---|---|
+| Unitaires & intégration | **Vitest** | Intégration native Next 15, rapide, syntaxe Jest-like |
+| End-to-end | **Playwright** | Standard de fait, gère iOS/Android emulation, dev tools intégrés |
+| Tests DB | Vitest + Supabase JS client | Pointer sur projet `fidela-test` séparé |
+
+### Les 3 briques à tester (priorité haute)
+
+#### 1. Génération `.pkpass` (Apple)
+
+`lib/wallets/apple.test.ts` :
+
+```typescript
+describe('generateApplePass', () => {
+  test('génère un pkpass parseable', async () => {
+    const buffer = await generateApplePass(mockPass);
+    expect(buffer).toBeInstanceOf(Buffer);
+    expect(buffer.length).toBeGreaterThan(1000);
+  });
+
+  test('inclut le bon serial_number', async () => {
+    const buffer = await generateApplePass(mockPass);
+    const json = extractPassJson(buffer); // unzip pkpass et lire pass.json
+    expect(json.serialNumber).toBe(mockPass.serial_number);
+    expect(json.authenticationToken).toBe(mockPass.auth_token);
+  });
+
+  test('couleurs hex correctement appliquées', async () => {
+    const buffer = await generateApplePass({ ...mockPass, primary_color: '#FF0000' });
+    const json = extractPassJson(buffer);
+    expect(json.backgroundColor).toBe('rgb(255, 0, 0)');
+  });
+});
+```
+
++ test manuel E2E une fois par sprint : générer un pass réel, l'envoyer sur un iPhone, vérifier qu'il s'installe et s'ouvre.
+
+#### 2. Webhook Stripe
+
+`app/api/webhooks/stripe/route.test.ts` :
+
+```typescript
+describe('POST /api/webhooks/stripe', () => {
+  test('rejette 400 si signature manquante', async () => {
+    const res = await POST(makeRequest({ body: '{}' }));
+    expect(res.status).toBe(400);
+  });
+
+  test('rejette 400 si signature invalide', async () => {
+    const res = await POST(makeRequest({
+      body: '{}',
+      headers: { 'stripe-signature': 'invalide' }
+    }));
+    expect(res.status).toBe(400);
+  });
+
+  test('checkout.session.completed → crée merchant', async () => {
+    const event = makeStripeEvent('checkout.session.completed', { /* ... */ });
+    const res = await POST(makeRequest({
+      body: JSON.stringify(event),
+      headers: { 'stripe-signature': signEvent(event) }
+    }));
+    expect(res.status).toBe(200);
+    const merchant = await supabase.from('merchants').select().eq('stripe_customer_id', event.data.object.customer);
+    expect(merchant.data).toHaveLength(1);
+    expect(merchant.data[0].subscription_status).toBe('active');
+  });
+
+  test('idempotence : 2 webhooks identiques = 1 seul merchant', async () => {
+    // ...envoie 2x → vérifie 1 seule ligne
+  });
+
+  test('invoice.payment_failed → passe en past_due', async () => { /* ... */ });
+});
+```
+
+#### 3. Anti-fraude `add_stamp`
+
+`db/tests/add_stamp.test.sql` (ou Vitest qui appelle .rpc) :
+
+```typescript
+describe('add_stamp()', () => {
+  test('ajoute un tampon si pass valide et > 30 min', async () => {
+    const { data, error } = await supabase.rpc('add_stamp', { p_customer_pass_id: pass.id });
+    expect(error).toBeNull();
+    expect(data).toBe(1);
+  });
+
+  test('rejette si dernier tampon < 30 min', async () => {
+    await supabase.rpc('add_stamp', { p_customer_pass_id: pass.id });
+    const { error } = await supabase.rpc('add_stamp', { p_customer_pass_id: pass.id });
+    expect(error.message).toContain('30 minutes');
+  });
+
+  test('rejette si caller ne possède pas le merchant', async () => {
+    await supabaseAsOtherMerchant.rpc('add_stamp', { p_customer_pass_id: pass.id });
+    expect(error.code).toBe('42501');
+  });
+
+  test('atomique sous race condition', async () => {
+    // 10 appels concurrents → 1 seul succès, 9 erreurs
+    const promises = Array.from({ length: 10 }, () =>
+      supabase.rpc('add_stamp', { p_customer_pass_id: pass.id })
+    );
+    const results = await Promise.allSettled(promises);
+    const successes = results.filter(r => r.status === 'fulfilled' && !r.value.error);
+    expect(successes).toHaveLength(1);
+  });
+});
+```
+
+### 2 tests E2E Playwright (priorité haute)
+
+#### E2E-1 — Inscription commerçant complète
+
+```typescript
+test('un commerçant peut créer son compte, payer et accéder au dashboard', async ({ page }) => {
+  await page.goto('/');
+  await page.click('text=Démarrer mon programme');
+  // ... fill signup, mock Stripe test mode, complete checkout
+  await expect(page).toHaveURL(/\/dashboard/);
+  await expect(page.locator('h1')).toContainText('Bienvenue');
+});
+```
+
+#### E2E-2 — Parcours client (inscription + ajout pass)
+
+```typescript
+test('un client peut scanner le QR et recevoir son pass', async ({ page }) => {
+  await page.goto('/c/test-boulangerie');
+  await page.fill('[name=email]', 'client@test.fr');
+  await page.check('[name=consent]');
+  await page.click('text=Recevoir ma carte');
+  // vérifie qu'on récupère un lien pkpass ou un lien Google Wallet
+  await expect(page.locator('a:has-text("Ajouter à")')).toBeVisible();
+});
+```
+
+### Ce qu'on ne teste PAS (volontaire)
+
+- UI dashboard (composants shadcn/ui standards, peu de logique)
+- Server actions simples (updateMerchantProfile, etc.) : tests manuels au moment du build
+- Pages publiques statiques (landing, conditions, politique de confidentialité)
+- Génération QR code (lib `qrcode` éprouvée)
+- Upload logo (Supabase Storage géré)
+
+### Tests manuels structurés
+
+`docs/test-checklists/` :
+- `sprint-1-auth.md` — checklist signup, login, logout, reset password
+- `sprint-3-apple-wallet.md` — checklist génération sur 3 iPhones différents (iOS 16, 17, 18)
+- `sprint-6-tampon.md` — checklist scan QR, saisie code, anti-fraude UI, claim récompense
+
+À cocher manuellement avant chaque déploiement production.
+
+### Couverture cible
+
+- **Code testé automatiquement : ~30%** (les briques critiques uniquement)
+- **Couverture des risques business : 100%** (tout ce qui touche fric ou DB integrity est testé)
+
+Couvre l'essentiel sans noyer dans la maintenance de tests.
+
+---
+
+## Livrable 10 — Estimation complexité par sprint
+
+### Méthode
+
+Pour chaque sprint, je découpe en sous-tâches granulaires et j'estime en **jours-homme pour Solal en mode claude-powered**. Hypothèses :
+- 6h de focus dev par jour (le reste : interviews terrain, démarchage, admin)
+- Claude écrit le code sous direction Bob, mais Solal doit comprendre, tester, débugger
+- 1 jour de buffer par sprint pour les surprises
+
+### Détail
+
+| Sprint | Brief original | Mon estimation | Δ |
+|---|---|---|---|
+| **0 (setup)** | non prévu | **5j** | +5j |
+| 1 (Landing + auth + waitlist) | 10j | **10j** | = |
+| 2 (Dashboard config programme) | 10j | **10j** | = |
+| 3 (Apple Wallet) | 15j | **20j** | +5j |
+| 4 (Google Wallet) | 10j | **10j** | = |
+| 5 (Parcours client `/c/[slug]`) | 10j | **10j** | = |
+| 6 (Système tampon + push) | 10j | **15j** | +5j |
+| **Total** | **65j (13 sem)** | **80j (16 sem)** | **+15j** |
+
+### Justification des amendements
+
+#### Sprint 0 — Setup (5j) — AJOUT
+
+Pas dans le brief mais indispensable. Compte Apple Developer prend 24-48h de validation Apple, c'est bloquant pour le Sprint 3. À démarrer dès Sprint 1.
+
+Contenu :
+- Créer projets Supabase dev + prod
+- Configurer Vercel + variables env
+- Créer compte Apple Developer ($99 + délai validation)
+- Créer compte Stripe + activation paiement
+- Créer Pass Type ID + générer certificats (livrable 6)
+- Setup repo Next 15 + ESLint + Prettier + Tailwind + shadcn init
+- Premier déploiement preview vide qui marche
+- Sentry init
+
+#### Sprint 3 — Apple Wallet (+5j, total 20j)
+
+Le brief sous-estime. La complexité Apple :
+- Comprendre la spec PassKit (pass.json, manifest, signature)
+- Maîtriser `passkit-generator` (peu doc'é)
+- Implémenter les 5 callbacks Web Service Protocol
+- Setup APNs (envoi push)
+- Tester sur vrais iPhones (au moins 2-3 modèles différents)
+- Debugging signature (la moitié du temps perdu en certif issues)
+
+Sprint le plus risqué. **Si je devais conseiller un seul sprint à étaler, c'est celui-ci.**
+
+#### Sprint 6 — Système tampon + push (+5j, total 15j)
+
+Brief sous-estime aussi. Inclus :
+- UI scan QR + saisie code (testée sur smartphone)
+- API stamps + claim récompense
+- Push update Apple (APNs réel, pas mock)
+- Push update Google (PATCH objet, gestion erreurs API)
+- Anti-fraude UI feedback
+- Tests bout-en-bout flow complet
+
+### Total : ~16 semaines (4 mois) de dev MVP
+
+Pour un junior claude-powered à 6h/jour. Ajoute 4-8 semaines pour la phase 0 (interviews terrain, validation prix) et les imprévus = lancement réaliste **5-6 mois après le démarrage du code**.
+
+---
+
+## Livrable 11 — Risques techniques + mitigation
+
+### Top 12 risques (du plus probable/grave au moins)
+
+| # | Risque | Probabilité | Gravité | Mitigation |
+|---|---|---|---|---|
+| **R1** | **Certificat Apple expiré non renouvelé** : plus de nouveau pass possible | Haute (oubli) | Critique | Calendar alert 30j avant. Cron `/api/cron/check-cert-expiry` qui ping Slack/email à J-30, J-7, J-1. |
+| **R2** | **Webhook Stripe manqué** : subscription payée mais non activée chez nous | Moyenne | Haute | Idempotence (table `stripe_events_processed`) + cron quotidien `reconcile-stripe` qui repère les paiements sans merchant. |
+| **R3** | **Bug dans génération `.pkpass`** : tous les passes émis cassés | Faible | Critique | Tests automatisés (livrable 9). Feature flag pour basculer sur version précédente en cas de regression. Monitoring Sentry sur lib wallets. |
+| **R4** | **APNs push tokens expirés en masse** : updates pass ne se propagent plus | Moyenne | Moyenne | Cleanup automatique sur échec APNs (DELETE row apple_devices). User réenregistrera son device au prochain ajout au Wallet. |
+| **R5** | **Vercel function timeout** sur génération pass (>10s) | Faible | Haute | Optimiser passkit-generator (cache cert loading). Si vraiment besoin, passer au plan Pro Vercel (60s timeout). Budget monitor : alerte si > 5s. |
+| **R6** | **Supabase free tier dépassé** (DB size, MAU) | Haute (succès) | Moyenne | Monitoring quota via Supabase dashboard. Upgrade Pro plan dès 30+ merchants. |
+| **R7** | **Race condition tampon** : 2 tampons en parallèle bypass anti-fraude | Faible (déjà mitigée) | Haute | **Déjà mitigé par la fonction `add_stamp()` atomique en DB.** Test sous charge dans Sprint 6. |
+| **R8** | **RGPD non conforme** : amende CNIL | Faible | Critique | Registre des traitements (Notion), droits accès + effacement implémentés, hébergement Frankfurt, consentement explicite. Faire relire par juriste avant lancement public. |
+| **R9** | **Apple Developer account suspendu** (ToS violation accidentelle) | Très faible | Critique | MFA obligatoire sur compte. Lire les guidelines Wallet attentivement. Ne pas spammer push. Backup : compte secondaire d'urgence. |
+| **R10** | **Vol/exposition certificat Apple `.p12`** | Faible | Critique | `.p12` jamais commité (gitignore). Variables Vercel marked "Sensitive". Rotation immédiate si suspicion. |
+| **R11** | **Frankfurt outage Supabase** : app down quelques heures | Très faible | Haute | Pas de plan B en MVP (acceptable au volume). Statuspage Supabase suivi. Communication user via status page Fidela (à créer Sprint 1). |
+| **R12** | **Google Wallet API rate limit** : si beaucoup de tampons en simultané | Faible | Moyenne | Queue async (par exemple Vercel KV ou simple debounce DB). Pas critique en MVP volume. |
+
+### Risques business adjacents (rappel, hors scope archi mais à connaître)
+
+- **Personne n'utilise** : MVP doit valider la traction avant les 6 sprints. → Phase 0 interviews terrain.
+- **Stripe ferme le compte** (faux flag fraude) : compte test → vrai dès que possible, paperasse SAS prête.
+- **Concurrent lance plus vite** : pas mon problème, c'est marché compétitif.
+
+---
+
+## Livrable 12 — Plan de découpage en sprints (amendé)
+
+### Plan final 7 sprints (16 semaines = 4 mois)
+
+#### Sprint 0 — Setup (semaine 1) — NOUVEAU
+
+**Objectif :** environnement prêt à coder.
+
+**Done quand :**
+- [ ] Repo Next 15 init, déployé Vercel preview (page vide qui marche)
+- [ ] Supabase dev + prod créés, `schema.sql` + `rls.sql` appliqués sur dev
+- [ ] Compte Apple Developer validé, Pass Type ID créé, certificats générés et stockés local + Vercel
+- [ ] Compte Stripe activé en mode test
+- [ ] Sentry projet créé, DSN en env var
+- [ ] ESLint + Prettier + Tailwind + shadcn init
+- [ ] Variables env documentées dans `.env.example`
+
+**Critères deploy :** Vercel preview accessible, healthcheck `/api/health` OK.
+
+#### Sprint 1 — Landing + auth + waitlist (semaines 2-3)
+
+**Objectif :** un visiteur peut s'inscrire à la waitlist OU démarrer un compte commerçant et se connecter.
+
+**Done quand :**
+- [ ] Landing publique `/` avec pitch + 2 CTAs
+- [ ] Formulaire waitlist `/api/waitlist` fonctionnel
+- [ ] Signup commerçant `/signup` avec Supabase Auth (email + password)
+- [ ] Email de vérification reçu (Resend ou Postmark configuré)
+- [ ] Login / logout fonctionnels
+- [ ] Reset password fonctionnel
+- [ ] Layout dashboard `/dashboard` (vide mais accessible une fois loggué)
+
+**Critères deploy :** déploiement production, landing + waitlist live. Signup commerçant accessible mais pas annoncé publiquement.
+
+#### Sprint 2 — Onboarding + config programme (semaines 4-5)
+
+**Objectif :** un commerçant peut s'onboarder, payer, configurer son programme et imprimer son QR code.
+
+**Done quand :**
+- [ ] Wizard onboarding 6 étapes (infos boutique → logo → programme → slug → preview → paiement)
+- [ ] Upload logo via `/api/uploads/logo` → Supabase Storage
+- [ ] Stripe Checkout intégré (mode test) — 99€ setup + 19€/mois
+- [ ] Webhook `/api/webhooks/stripe` traite checkout.session.completed
+- [ ] Idempotence sur webhook (table `stripe_events_processed`)
+- [ ] Dashboard `/dashboard` affiche infos merchant + programme + QR code téléchargeable PDF
+- [ ] Server actions : updateMerchantProfile, updateLoyaltyProgram
+
+**Critères deploy :** un beta-testeur peut payer (mode test) et accéder à son dashboard.
+
+#### Sprint 3 — Apple Wallet (semaines 6-9, **4 semaines**)
+
+**Objectif :** un pass Apple Wallet est généré, signé, et installable sur un iPhone réel.
+
+**Done quand :**
+- [ ] `lib/wallets/apple.ts` génère un `.pkpass` valide
+- [ ] Tests unitaires Vitest passent (livrable 9 § 1)
+- [ ] Route `GET /api/passes/apple/[serial]` sert le pass
+- [ ] 5 callbacks PassKit Web Service Protocol implémentés
+- [ ] APNs (Apple Push Notification) setup côté serveur
+- [ ] Test E2E manuel : générer un pass, l'envoyer par email, l'ouvrir sur iPhone, vérifier qu'il s'installe et reste à jour quand on push une modif
+- [ ] Documentation interne : comment renouveler le certificat
+
+**Critères deploy :** pass Apple installable sur iOS 16, 17, 18.
+
+#### Sprint 4 — Google Wallet (semaines 10-11)
+
+**Objectif :** un pass Google Wallet est généré et installable sur Android.
+
+**Done quand :**
+- [ ] `lib/wallets/google.ts` crée un loyaltyObject via API REST
+- [ ] Service account Google + JWT auth en place
+- [ ] Route `GET /api/passes/google/[serial]` retourne save URL signée
+- [ ] Test sur Android réel (au moins 2 versions)
+- [ ] Mise à jour pass via PATCH loyaltyObject fonctionne
+
+**Critères deploy :** pass Google installable sur Android 12+.
+
+#### Sprint 5 — Parcours client `/c/[slug]` (semaines 12-13)
+
+**Objectif :** un client peut scanner le QR, s'inscrire, recevoir son pass dans son Wallet.
+
+**Done quand :**
+- [ ] Page publique `/c/[slug]` avec branding merchant
+- [ ] Détection iOS/Android via User-Agent
+- [ ] Formulaire inscription (email OU phone) avec consentement RGPD
+- [ ] Route `/api/customers/signup` : dedup, INSERT customer + pass, génère wallet
+- [ ] Email de bienvenue avec lien de récupération du pass
+- [ ] Test E2E Playwright passe (livrable 9 § E2E-2)
+- [ ] RGPD : page politique de confidentialité, route `/api/customers/[id]/export`
+
+**Critères deploy :** un client peut scanner et avoir son pass dans son Wallet en moins de 30 secondes.
+
+#### Sprint 6 — Tampon + push update (semaines 14-16, **3 semaines**)
+
+**Objectif :** un commerçant peut tamponner un client depuis son smartphone, et le pass se met à jour automatiquement.
+
+**Done quand :**
+- [ ] `/dashboard/stamp` : caméra scan QR pass + fallback saisie code
+- [ ] Route `/api/stamps` utilise `add_stamp()` Postgres function
+- [ ] Push Apple APNs déclenché → pass iOS mis à jour
+- [ ] PATCH Google Wallet → pass Android mis à jour
+- [ ] Route `/api/rewards/claim` fonctionnelle
+- [ ] UI feedback anti-fraude 30 min (toast clair)
+- [ ] Tests automatisés `add_stamp` passent (livrable 9 § 3)
+- [ ] Test E2E manuel : tamponner depuis iPhone, le pass se met à jour côté client en < 5s
+- [ ] Test charge basique (10 tampons concurrents → 1 seul ajouté)
+
+**Critères deploy :** MVP complet, prêt pour les 10 premiers commerçants pilotes.
+
+### Recommandations transversales
+
+1. **Démarrer Sprint 0 EN PARALLÈLE de la Phase 0 interviews terrain.** Le compte Apple Developer prend 24-48h, profite de ce délai pour valider le pricing.
+2. **Pas de production avant Sprint 5 fini.** Avant ça, déploiements preview Vercel uniquement, beta-testeurs invités à la main.
+3. **Documenter au fur et à mesure** dans `docs/decisions/` (ADR — Architecture Decision Records). Chaque arbitrage non-trivial = 1 fichier MD. Future-Solal te remerciera.
+4. **Démo bi-hebdomadaire à un mentor / pair** pendant les 4 mois. Force à montrer du concret, détecte les dérives tôt.
+5. **Buffer 20% sur le total** si phase imprévus → cible **20 semaines (5 mois) de zéro à MVP livrable**.
+
+---
+
+## Validation attendue de Solal (paquet 3)
+
+Avant que Bob commence à coder le Sprint 0, valider :
+
+1. **Flow commerçant** : la séquence Phase 1-4 correspond à ta vision UX ?
+2. **Stratégie tests** : OK avec 30% de couverture auto focus sur les 3 zones critiques ?
+3. **Estimation 16 semaines vs 13 du brief initial** : tu es prêt à étaler ? Ou tu veux garder 13 semaines et accepter le risque d'overrun ?
+4. **Risques** : il y en a un que je n'ai pas vu ?
+5. **Plan sprints** : OK avec l'ajout du Sprint 0 et l'extension Sprint 3 (Apple) ?
+
+Une fois ces 5 points validés → **fin des livrables architecte**. Prochaine étape : Arch écrit le brief pour Bob de la Step 1 (= Sprint 0).

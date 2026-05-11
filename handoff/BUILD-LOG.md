@@ -5,9 +5,10 @@
 
 ## Current Status
 
-**Active step:** Pré-Step 0 — Production des 12 livrables architecte (section 9 de ARCHITECTURE_BRIEF.md)
-**Paquet en cours :** Paquet 2 (livrables 4-7) — LIVRÉ, attente validation Solal
-**Paquets livrés :** 1 (validation tacite "ça va, continue"), 2 (à valider)
+**Active step:** Pré-Step 0 — Production des 12 livrables architecte (section 9 de ARCHITECTURE_BRIEF.md) — COMPLET (12/12)
+**Paquet en cours :** Paquet 3 (livrables 8-12) — LIVRÉ, attente validation Solal
+**Paquets livrés :** 1 (validé), 2 (validé), 3 (à valider)
+**Next step après validation :** Step 1 = Sprint 0 (setup environnement)
 **Last cleared:** —
 **Pending deploy:** NO
 
@@ -85,6 +86,30 @@ Cas limites identifiés pour Bob :
 
 Reviewer findings: — (revue Richard prévue après validation Solal)
 Deploy: N/A
+
+---
+
+### Pré-Step 0 Paquet 3 — Livrables 8-12 (flow commerçant, tests, estimation, risques, plan sprints) — LIVRÉ, en attente validation
+*Date: 2026-05-11*
+
+Files produced:
+- `handoff/ARCHITECT-DELIVERABLES.md` — section "Paquet 3" ajoutée (~1100 lignes au total)
+
+Decisions made (paquet 3) :
+- Flow commerçant détaillé en 4 phases (découverte, onboarding, configuration, quotidien)
+- Création merchant via WEBHOOK Stripe (pas via redirect success) pour idempotence et fiabilité
+- Table `onboarding_drafts` à ajouter au schéma pour stocker le wizard avant paiement (à intégrer dans une migration future)
+- Cron Vercel `reconcile-stripe` quotidien pour rattraper les webhooks perdus
+- Stratégie tests : Vitest + Playwright. Couverture auto ~30%, focus sur 3 briques critiques (pkpass gen, webhook Stripe, add_stamp anti-fraude). Tests manuels structurés en checklists par sprint.
+- Estimation amendée : 16 semaines (vs 13 du brief). Ajout Sprint 0 setup (5j), extension Sprint 3 Apple (+5j) et Sprint 6 tampon (+5j).
+- 12 risques techniques identifiés avec mitigation, top 3 : certif Apple expiré, webhook Stripe manqué, bug gen pkpass.
+- Plan sprints final 7 sprints (Sprint 0 à 6) avec critères "Done" par sprint.
+- Recommandation Phase 0 interviews terrain en PARALLÈLE de Sprint 0 (compte Apple Dev prend 48h).
+
+Note : table `onboarding_drafts` PAS encore dans schema.sql. À ajouter lors de l'écriture du brief Sprint 2 pour Bob.
+
+Reviewer findings: — (revue Richard sur l'ensemble des 12 livrables prévue après validation Solal)
+Deploy: N/A (production des livrables architecte terminée)
 
 ---
 
